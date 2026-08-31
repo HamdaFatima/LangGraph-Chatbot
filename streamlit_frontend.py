@@ -1,5 +1,5 @@
 import streamlit as st
-from langgraph_backend import chatbot, retrieve_all_threads
+from langgraph_backend import chatbot, retrieve_all_threads, get_conversation_state, iter_async
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import uuid
 
@@ -39,10 +39,11 @@ def is_tool_call_chunk(message_chunk):
     return bool(
         getattr(message_chunk, "tool_calls", None)
         or getattr(message_chunk, "tool_call_chunks", None)
-    )        
+    )
 
 def load_conversation(thread_id):
-    state = chatbot.get_state(config={"configurable": {"thread_id": thread_id}})
+    # ✅ FIX: use the async-safe wrapper instead of chatbot.get_state (sync)
+    state = get_conversation_state(thread_id)
     messages = state.values.get("messages", [])
     # ✅ FIX: Filter out ToolMessages
     return [msg for msg in messages if not isinstance(msg, ToolMessage)]
@@ -106,11 +107,19 @@ if user_input:
         status_holder = {"box": None}
 
         def ai_only_stream():
-            for message_chunk, metadata in chatbot.stream(
-                {"messages": [HumanMessage(content=user_input)]},
-                config=CONFIG,
-                stream_mode="messages",
-            ):
+            # chatbot.astream(...) is an async generator (required now that
+            # MCP tools + the checkpointer are async-only). iter_async drives
+            # it on the backend's dedicated event-loop thread and yields
+            # items synchronously so st.write_stream can consume it as usual.
+            async def _astream():
+                async for message_chunk, metadata in chatbot.astream(
+                    {"messages": [HumanMessage(content=user_input)]},
+                    config=CONFIG,
+                    stream_mode="messages",
+                ):
+                    yield message_chunk, metadata
+
+            for message_chunk, metadata in iter_async(_astream()):
                 if isinstance(message_chunk, ToolMessage):
                     tool_name = getattr(message_chunk, "name", "tool")
                     if status_holder["box"] is None:

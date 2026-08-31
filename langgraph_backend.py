@@ -1,119 +1,161 @@
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated
+from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from dotenv import load_dotenv
-from langgraph.checkpoint.sqlite import SqliteSaver
-import os
-import sqlite3
-import requests
-
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_core.tools import tool
+from langchain_core.tools import tool, BaseTool
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from dotenv import load_dotenv
+import aiosqlite
+import requests
+import asyncio
+import threading
 
 load_dotenv()
 
-api_key = os.getenv("GEMINI_API_KEY")
+# Dedicated async loop for backend tasks
+_ASYNC_LOOP = asyncio.new_event_loop()
+_ASYNC_THREAD = threading.Thread(target=_ASYNC_LOOP.run_forever, daemon=True)
+_ASYNC_THREAD.start()
 
-model = ChatGoogleGenerativeAI(model='gemini-2.5-flash', api_key=api_key)
 
-SYSTEM_PROMPT = SystemMessage(content=(
-    "You are a helpful assistant with access to tools: calculator, "
-    "get_stock_price, and a web search tool. "
-    "Only use a tool when the question genuinely requires it — "
-    "for example, real-time stock prices, current events, or arithmetic "
-    "on numbers you don't already know. "
-    "For general knowledge questions you can answer confidently and "
-    "accurately on your own (e.g. capitals, historical facts, definitions), "
-    "answer directly without calling any tool."
-))
+def _submit_async(coro):
+    return asyncio.run_coroutine_threadsafe(coro, _ASYNC_LOOP)
 
-# Tools
-search_tool = DuckDuckGoSearchRun(region='us-en')
 
-@tool
-def calculator(first_num: float, second_num: float, operation: str) -> float:
-    """
-    Perform a basic arithmetic operation on two numbers.
-    Supported operations: add, subtract, multiply, divide
-    """
-    try:
-        if operation == 'add':
-            return first_num + second_num
-        elif operation == 'subtract':
-            return first_num - second_num
-        elif operation == 'multiply':
-            return first_num * second_num
-        elif operation == 'divide':
-            if second_num != 0:
-                return first_num / second_num
-            else:
-                raise ValueError("Cannot divide by zero.")
-        else:
-            raise ValueError("Invalid operation. Please use 'add', 'subtract', 'multiply', or 'divide'.")
-    except Exception as e:
-        return {"error": str(e)}
+def run_async(coro):
+    return _submit_async(coro).result()
+
+
+def submit_async_task(coro):
+    """Schedule a coroutine on the backend event loop."""
+    return _submit_async(coro)
+
+
+# -------------------
+# 1. LLM
+# -------------------
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+
+# -------------------
+# 2. Tools
+# -------------------
+search_tool = DuckDuckGoSearchRun(region="us-en")
+
 
 @tool
 def get_stock_price(symbol: str) -> dict:
-    """Fetch latest stock price for a given symbol (e.g. 'AAPL','TSLA')
-    using alpha Vantage API key in the URL"""
-    # Fixed the f-string - removed nested quotes
-    api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={api_key}"
+    """
+    Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA') 
+    using Alpha Vantage with API key in the URL.
+    """
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey=C9PE94QUEW9VWGFM"
     r = requests.get(url)
     return r.json()
 
-# Make tools list
-tools = [get_stock_price, calculator, search_tool]
 
-tool_node = ToolNode(tools)
-
-# ✅ Use llm_with_tools (model with tools bound)
-llm_with_tools = model.bind_tools(tools)
-
-class chatState(TypedDict):
-    messages: Annotated[list[BaseMessage], add_messages]
-
-def chat_node(state: chatState):
-    messages = state['messages']
-    
-    # Prepend system prompt if not already present
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [SYSTEM_PROMPT] + messages
-
-    response = llm_with_tools.invoke(messages)
-    
-    return {'messages': [response]}
-
-conn = sqlite3.connect(database='chatbot.db', check_same_thread=False)
-checkpoint = SqliteSaver(conn=conn)
-
-graph = StateGraph(chatState)
-
-graph.add_node('chat_node', chat_node)
-graph.add_node('tools', tool_node)
-
-graph.add_edge(START, 'chat_node')
-
-# ✅ FIXED: Add the conditional edge mapping
-graph.add_conditional_edges(
-    'chat_node',
-    tools_condition,
+client = MultiServerMCPClient(
     {
-        'tools': 'tools',    # If tools needed, go to 'tools' node
-        '__end__': END       # If no tools needed, end
+        "arith": {
+            "transport": "stdio",
+            "command": "python3",
+            "args": ["/Users/nitish/Desktop/mcp-math-server/main.py"],
+        },
+        "expense": {
+            "transport": "streamable_http",  # if this fails, try "sse"
+            "url": "https://splendid-gold-dingo.fastmcp.app/mcp"
+        }
     }
 )
 
-graph.add_edge('tools', 'chat_node')
 
-chatbot = graph.compile(checkpointer=checkpoint)
+def load_mcp_tools() -> list[BaseTool]:
+    try:
+        return run_async(client.get_tools())
+    except Exception:
+        return []
+
+
+mcp_tools = load_mcp_tools()
+
+tools = [search_tool, get_stock_price, *mcp_tools]
+llm_with_tools = llm.bind_tools(tools) if tools else llm
+
+# -------------------
+# 3. State
+# -------------------
+class ChatState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+# -------------------
+# 4. Nodes
+# -------------------
+async def chat_node(state: ChatState):
+    """LLM node that may answer or request a tool call."""
+    messages = state["messages"]
+    response = await llm_with_tools.ainvoke(messages)
+    return {"messages": [response]}
+
+
+tool_node = ToolNode(tools) if tools else None
+
+# -------------------
+# 5. Checkpointer
+# -------------------
+
+
+async def _init_checkpointer():
+    conn = await aiosqlite.connect(database="chatbot.db")
+    return AsyncSqliteSaver(conn)
+
+
+checkpointer = run_async(_init_checkpointer())
+
+# -------------------
+# 6. Graph
+# -------------------
+graph = StateGraph(ChatState)
+graph.add_node("chat_node", chat_node)
+graph.add_edge(START, "chat_node")
+
+if tool_node:
+    graph.add_node("tools", tool_node)
+    graph.add_conditional_edges("chat_node", tools_condition)
+    graph.add_edge("tools", "chat_node")
+else:
+    graph.add_edge("chat_node", END)
+
+chatbot = graph.compile(checkpointer=checkpointer)
+
+# -------------------
+# 7. Helper
+# -------------------
+async def _alist_threads():
+    all_threads = set()
+    async for checkpoint in checkpointer.alist(None):
+        all_threads.add(checkpoint.config["configurable"]["thread_id"])
+    return list(all_threads)
+
 
 def retrieve_all_threads():
-    all_threads = set()
-    for item in checkpoint.list(None):
-        all_threads.add(item.config['configurable']['thread_id'])
-    return list(all_threads)
+    return run_async(_alist_threads())
+
+def get_conversation_state(thread_id):
+    """Sync-friendly wrapper around chatbot.aget_state for the frontend."""
+    config = {"configurable": {"thread_id": thread_id}}
+    return run_async(chatbot.aget_state(config=config))
+
+
+def iter_async(async_gen):
+    """Bridge an async generator to a sync generator, driven by the backend's
+    dedicated event-loop thread — needed because chatbot.astream() must run
+    on the same loop the checkpointer's aiosqlite connection is bound to."""
+    while True:
+        try:
+            item = submit_async_task(async_gen.__anext__()).result()
+        except StopAsyncIteration:
+            break
+        yield item
